@@ -29,3 +29,6 @@ models/
 *.pt
 # Demo generated assets
 demo_assets/
+
+# Fine-tuning dataset
+EvoTrack_Finetuning_Dataset/
