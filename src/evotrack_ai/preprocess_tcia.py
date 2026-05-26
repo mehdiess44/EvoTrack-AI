@@ -12,6 +12,7 @@ from typing import Iterable
 import cv2
 import nibabel as nib
 import numpy as np
+from skimage.metrics import structural_similarity as ssim
 from tqdm import tqdm
 
 
@@ -29,6 +30,7 @@ TIMEPOINT_PATTERN = re.compile(
     flags=re.IGNORECASE,
 )
 SAFE_NAME_PATTERN = re.compile(r"[^A-Za-z0-9_.-]+")
+Z_SEARCH_RADIUS = 15
 
 
 @dataclass(frozen=True)
@@ -211,12 +213,87 @@ class SliceProcessor:
         return SliceProcessor.robust_window_uint8(slice_2d)
 
     @staticmethod
+    def extract_windowed_flair_from_volume(
+        volume: np.ndarray, z_index: int, source: str | Path,
+    ) -> np.ndarray:
+        """Applique le windowing sur une tranche d'un volume deja charge."""
+
+        slice_2d = extract_axial_slice(volume, z_index, source)
+        return SliceProcessor.robust_window_uint8(slice_2d)
+
+    @staticmethod
     def extract_binary_mask(seg_path: str | Path, z_index: int) -> np.ndarray:
         """Charge une tranche de segmentation et la convertit en masque uint8."""
 
         volume = load_nifti_volume(seg_path)
         slice_2d = extract_axial_slice(volume, z_index, seg_path)
         return ((slice_2d > 0).astype(np.uint8) * 255)
+
+    @staticmethod
+    def find_best_t1_slice(
+        ref_slice_t0: np.ndarray,
+        volume_t1: np.ndarray,
+        z_ref: int,
+        radius: int = Z_SEARCH_RADIUS,
+    ) -> int:
+        """Recherche la coupe T1 la plus similaire a la reference T0 par SSIM.
+
+        Explore une fenetre glissante de [z_ref - radius, z_ref + radius]
+        dans le volume T1 et retourne l'indice Z qui maximise le SSIM
+        avec la tranche T0 de reference.
+        """
+
+        depth_t1 = volume_t1.shape[2]
+        z_start = max(0, z_ref - radius)
+        z_end = min(depth_t1, z_ref + radius + 1)
+
+        # Normaliser la reference T0 en float32 pour le calcul SSIM.
+        ref_f32 = np.asarray(ref_slice_t0, dtype=np.float32)
+        ref_f32 = np.nan_to_num(ref_f32, nan=0.0, posinf=0.0, neginf=0.0)
+
+        best_z = z_ref
+        best_score = -1.0
+
+        for z_candidate in range(z_start, z_end):
+            candidate_slice = volume_t1[:, :, z_candidate].astype(np.float32)
+            candidate_slice = np.nan_to_num(
+                candidate_slice, nan=0.0, posinf=0.0, neginf=0.0,
+            )
+
+            # Redimensionner si les tailles ne correspondent pas.
+            if candidate_slice.shape != ref_f32.shape:
+                candidate_slice = cv2.resize(
+                    candidate_slice,
+                    (ref_f32.shape[1], ref_f32.shape[0]),
+                    interpolation=cv2.INTER_AREA,
+                )
+
+            # Determiner le data_range depuis les deux images.
+            combined_range = max(
+                ref_f32.max() - ref_f32.min(),
+                candidate_slice.max() - candidate_slice.min(),
+                1e-6,
+            )
+
+            # win_size impair et <= min(dimension).
+            min_dim = min(ref_f32.shape[0], ref_f32.shape[1])
+            win_size = min(7, min_dim)
+            if win_size % 2 == 0:
+                win_size -= 1
+            win_size = max(win_size, 3)
+
+            score = ssim(
+                ref_f32,
+                candidate_slice,
+                win_size=win_size,
+                data_range=float(combined_range),
+            )
+
+            if score > best_score:
+                best_score = score
+                best_z = z_candidate
+
+        return best_z
 
     @staticmethod
     def robust_window_uint8(slice_2d: np.ndarray) -> np.ndarray:
@@ -346,10 +423,36 @@ def process_dataset(root_dir: str | Path, output_dir: str | Path) -> tuple[int, 
             validate_pair_files(pair)
             assert pair.t0.seg_path is not None
 
+            # --- Module 3 : Extraction avec recalage Z automatique ---
             z_index = locator.select_slice_index(pair.t0.seg_path)
-            flair_t0 = processor.extract_windowed_flair(pair.t0.flair_path, z_index)
-            flair_t1 = processor.extract_windowed_flair(pair.t1.flair_path, z_index)
+
+            # Charger le volume T0 et extraire la tranche de reference.
+            volume_t0 = load_nifti_volume(pair.t0.flair_path)
+            ref_slice_t0 = extract_axial_slice(volume_t0, z_index, pair.t0.flair_path)
+
+            # Charger le volume T1 et rechercher la coupe la plus similaire.
+            volume_t1 = load_nifti_volume(pair.t1.flair_path)
+            z_t1 = processor.find_best_t1_slice(ref_slice_t0, volume_t1, z_index)
+
+            # Signaler le decalage eventuel.
+            z_shift = z_t1 - z_index
+            if z_shift != 0:
+                shift_sign = f"+{z_shift}" if z_shift > 0 else str(z_shift)
+                tqdm.write(
+                    f"  [RECALAGE] {pair.patient_id} : "
+                    f"decalage Z de {shift_sign} corrige "
+                    f"(T0 z={z_index} -> T1 z={z_t1})"
+                )
+
+            # Appliquer le windowing sur les tranches finales.
+            flair_t0 = processor.extract_windowed_flair_from_volume(
+                volume_t0, z_index, pair.t0.flair_path,
+            )
+            flair_t1 = processor.extract_windowed_flair_from_volume(
+                volume_t1, z_t1, pair.t1.flair_path,
+            )
             mask_t0 = processor.extract_binary_mask(pair.t0.seg_path, z_index)
+
             exporter.export_pair(pair.patient_id, flair_t0, flair_t1, mask_t0)
             successes += 1
         except Exception as exc:
