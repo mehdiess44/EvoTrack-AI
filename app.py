@@ -17,6 +17,8 @@ import streamlit as st
 import tensorflow as tf
 from PIL import Image
 
+from vector_search import search_similar_cases
+
 # ============================================================================
 #  CONFIGURATION
 # ============================================================================
@@ -173,6 +175,49 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
+def extract_evolution_direction(uploaded_t0, uploaded_t1):
+    """
+    Détermine mathématiquement si l'évolution est une progression ou une régression.
+    Utilise un masquage du fond et une normalisation Z-Score pour annuler le 
+    biais d'acquisition (bias field) entre les deux sessions IRM.
+    """
+    img_t0 = Image.open(uploaded_t0).convert("L").resize(INPUT_SIZE, Image.LANCZOS)
+    img_t1 = Image.open(uploaded_t1).convert("L").resize(INPUT_SIZE, Image.LANCZOS)
+    
+    arr_t0 = np.asarray(img_t0, dtype=np.float32)
+    arr_t1 = np.asarray(img_t1, dtype=np.float32)
+    
+    # 1. Masquage (Brain Masking basique pour ignorer le fond noir)
+    mask_t0 = arr_t0 > 15
+    mask_t1 = arr_t1 > 15
+    brain_mask = mask_t0 & mask_t1  # Intersection pour avoir une zone commune
+    
+    if not np.any(brain_mask):
+        return "Progression"  # Sécurité fallback
+        
+    # 2. Normalisation Z-Score intra-masque
+    mean_t0, std_t0 = np.mean(arr_t0[brain_mask]), np.std(arr_t0[brain_mask])
+    mean_t1, std_t1 = np.mean(arr_t1[brain_mask]), np.std(arr_t1[brain_mask])
+    
+    # Protection division par zéro
+    std_t0 = std_t0 if std_t0 > 1e-5 else 1.0
+    std_t1 = std_t1 if std_t1 > 1e-5 else 1.0
+    
+    norm_t0 = np.zeros_like(arr_t0)
+    norm_t1 = np.zeros_like(arr_t1)
+    
+    norm_t0[brain_mask] = (arr_t0[brain_mask] - mean_t0) / std_t0
+    norm_t1[brain_mask] = (arr_t1[brain_mask] - mean_t1) / std_t1
+    
+    # 3. Soustraction signée et filtrage du bruit (seuil à 0.5 écart-type)
+    diff = norm_t1 - norm_t0
+    noise_threshold = 0.5 
+    
+    growth_mass = np.sum(diff[(diff > noise_threshold) & brain_mask])
+    shrink_mass = np.sum(-diff[(diff < -noise_threshold) & brain_mask])
+    
+    return "Progression" if growth_mass > shrink_mass else "Régression"
+
 # ── CSS Custom ───────────────────────────────────────────────────────────────
 st.markdown(
     """
@@ -245,6 +290,42 @@ st.markdown(
     .stImage > img {
         border-radius: 8px;
         border: 1px solid #1e293b;
+    }
+
+    .case-card {
+        background: linear-gradient(145deg, #111827 0%, #1e293b 100%);
+        border: 1px solid #334155;
+        border-radius: 12px;
+        padding: 1.3rem 1.2rem;
+        height: 100%;
+        transition: border-color 0.2s ease;
+    }
+    .case-card:hover {
+        border-color: #3b82f6;
+    }
+    .case-card .case-header {
+        font-size: 0.95rem;
+        font-weight: 600;
+        color: #e2e8f0;
+        margin-bottom: 0.3rem;
+    }
+    .case-card .case-sim {
+        font-size: 0.78rem;
+        color: #60a5fa;
+        margin-bottom: 0.7rem;
+    }
+    .case-card .case-label {
+        font-size: 0.75rem;
+        font-weight: 600;
+        color: #94a3b8;
+        text-transform: uppercase;
+        letter-spacing: 0.04em;
+        margin: 0.6rem 0 0.15rem 0;
+    }
+    .case-card .case-text {
+        font-size: 0.83rem;
+        color: #cbd5e1;
+        line-height: 1.45;
     }
     </style>
     """,
@@ -429,35 +510,97 @@ if uploaded_t0 and uploaded_t1:
 
             st.markdown("</div>", unsafe_allow_html=True)
 
-        # ── Disclaimer final ─────────────────────────────────────────
+        # ==============================================================
+        #  RAPPORT CLINIQUE DÉTERMINISTE & ROUTAGE NLP
+        # ==============================================================
+
+        st.markdown("---")
+        st.markdown("### 📝 Rapport Clinique & Recommandations")
+
+        if probability > EVOLUTION_THRESHOLD:
+            # 1. Analyse mathématique de la direction (100% Automatisé)
+            uploaded_t0.seek(0)
+            uploaded_t1.seek(0)
+            auto_direction = extract_evolution_direction(uploaded_t0, uploaded_t1)
+            
+            if auto_direction == "Progression":
+                # Requête silencieuse optimisée pour FAISS
+                search_query = "Évolution tumorale confirmée, progression spatiale de la lésion, augmentation du volume, aggravation."
+                # Texte affiché au médecin
+                clinical_text = (
+                    f"Suspicion de progression tumorale avec un score de confiance "
+                    f"de {prob_pct:.1f}%. Augmentation du volume observée. "
+                    f"Recommandation : Examen radiologique approfondi requis."
+                )
+                st.warning(f"🔴 **Alerte (Croissance) :** {clinical_text}")
+            else:
+                # Requête silencieuse optimisée pour FAISS
+                search_query = "Réduction du volume tumoral, réponse positive au traitement, diminution du signal, régression."
+                # Texte affiché au médecin
+                clinical_text = (
+                    f"Suspicion de régression tumorale avec un score de confiance "
+                    f"de {prob_pct:.1f}%. Réponse thérapeutique favorable. "
+                    f"Recommandation : Poursuite du traitement."
+                )
+                st.success(f"🟢 **Alerte (Réduction) :** {clinical_text}")
+
+        else:
+            stability_pct = 100.0 - prob_pct
+            search_query = "Stabilité complète, aucune modification volumétrique significative, pas de progression."
+            clinical_text = (
+                f"Analyse stable. Aucune progression significative mise en "
+                f"évidence (Stabilité estimée à {stability_pct:.1f}%). "
+                f"Recommandation : Poursuite du protocole de suivi standard."
+            )
+            st.info(f"⚪ **Analyse :** {clinical_text}")
+
+        # ==============================================================
+        #  AIDE À LA DÉCISION — CAS HISTORIQUES SIMILAIRES (FAISS)
+        # ==============================================================
+
+        st.markdown("---")
         st.markdown(
-            "<div class='disclaimer' style='margin-top:2rem;'>"
-            "⚕️ <strong>Résumé descriptif uniquement, sans diagnostic autonome.</strong> "
-            "Ce résultat doit être interprété par un neuro-oncologue qualifié "
-            "dans le contexte clinique complet du patient."
-            "</div>",
-            unsafe_allow_html=True,
+            "### 📚 Aide à la Décision : Cas Historiques Similaires "
+            "(NLP Vector Search)"
         )
 
-else:
-    # ── Écran d'accueil ──────────────────────────────────────────────────
-    st.markdown(
-        """
-        <div style="
-            text-align: center;
-            padding: 4rem 2rem;
-            color: #64748b;
-        ">
-            <p style="font-size: 3.5rem; margin-bottom: 0.5rem;">🧠</p>
-            <h2 style="color: #e2e8f0; font-weight: 600;">
-                Prêt pour l'analyse
-            </h2>
-            <p style="font-size: 1.05rem; max-width: 500px; margin: 0.8rem auto;">
-                Chargez les examens IRM <strong>T₀</strong> (baseline)
-                et <strong>T₁</strong> (suivi) depuis la barre latérale
-                pour commencer l'analyse longitudinale.
-            </p>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
+        with st.spinner(
+            "Recherche d'antécédents cliniques via "
+            "Sentence-Transformers et FAISS…"
+        ):
+            # /!\ CRITIQUE : FAISS utilise désormais search_query et non plus clinical_text
+            similar_cases = search_similar_cases(search_query, top_k=3)
+
+        if similar_cases:
+            case_cols = st.columns(3, gap="medium")
+
+            for col, case in zip(case_cols, similar_cases):
+                sim_score = case.get("similarity_score", 0.0)
+                if sim_score < 0.60:
+                    continue
+                with col:
+                    st.markdown(
+                        f"<div class='case-card'>"
+                        f"<div class='case-header'>"
+                        f"🧬 Patient {case['patient_id']}"
+                        f"</div>"
+                        f"<div class='case-sim'>"
+                        f"Similarité : {sim_score:.2f}"
+                        f"</div>"
+                        f"<div class='case-label'>Description</div>"
+                        f"<div class='case-text'>"
+                        f"<em>{case['clinical_description']}</em>"
+                        f"</div>"
+                        f"<div class='case-label'>Traitement appliqué</div>"
+                        f"<div class='case-text'>"
+                        f"{case['treatment_applied']}"
+                        f"</div>"
+                        f"<div class='case-label'>Issue clinique</div>"
+                        f"<div class='case-text'>"
+                        f"{case['outcome']}"
+                        f"</div>"
+                        f"</div>",
+                        unsafe_allow_html=True,
+                    )
+        else:
+            st.info("Aucun cas similaire trouvé dans la base historique.")
