@@ -18,6 +18,9 @@ Thumbs.db
 # Jupyter
 .ipynb_checkpoints/
 
+# Sphinx build outputs
+docs/_build/
+
 # Data, models, outputs
 data/raw/
 data/processed/
