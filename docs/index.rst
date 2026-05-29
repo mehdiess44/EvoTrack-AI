@@ -45,6 +45,12 @@ aucune performance clinique non validée.
 
 .. toctree::
    :maxdepth: 2
+   :caption: Sprints
+
+   sprints/sprint_7
+
+.. toctree::
+   :maxdepth: 2
    :caption: Référence
 
    math/formulas
