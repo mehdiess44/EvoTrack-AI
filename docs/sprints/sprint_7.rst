@@ -1,151 +1,112 @@
-Sprint 7 — Évaluation Fédérée Multicentrique & Optimisation Optuna
-==================================================================
+Benchmark fédéré multicentrique : Centralisé vs FedAvg vs FedBN
+===============================================================
 
-Le Sprint 7 correspond au notebook expérimental
-``notebooks/benchmark_federated.ipynb``. Ce notebook implémente un protocole
-de benchmark multicentrique pour comparer trois scénarios :
+Introduction
+------------
+
+Cette page documente le notebook expérimental
+``notebooks/benchmark_federated.ipynb``. Il met en place un benchmark
+comparatif entre trois stratégies d'entraînement pour EvoTrack-AI :
 
 * apprentissage centralisé ;
-* apprentissage fédéré standard avec FedAvg ;
-* apprentissage fédéré avec FedBN, où les couches ``BatchNormalization`` restent
-  locales.
+* apprentissage fédéré avec FedAvg ;
+* apprentissage fédéré avec FedBN.
 
-.. warning::
+Le protocole est académique et expérimental. Les métriques produites par le
+notebook ne constituent pas une validation clinique et ne doivent pas être
+interprétées comme des performances diagnostiques réelles.
 
-   Ce sprint reste expérimental et académique. Il ne constitue pas une
-   validation clinique réelle et ne permet pas de conclure à une performance
-   diagnostique.
+Objectif du benchmark
+---------------------
 
-Objectif global du sprint
--------------------------
+L'objectif est d'étudier l'impact d'un ``domain shift`` multicentrique simulé
+sur l'entraînement d'un modèle siamois longitudinal. Trois hôpitaux virtuels
+sont générés à partir des mêmes paires ``T0/T1``, avec des transformations
+différentes selon le centre.
 
-L'objectif réel du notebook est de valider un pipeline expérimental complet :
-chargement des paires longitudinales, simulation de trois centres virtuels,
-construction de datasets TensorFlow, optimisation Optuna, entraînement
-centralisé, entraînement FedAvg, entraînement FedBN et visualisation finale des
-courbes d'AUC.
+Le benchmark valide surtout le pipeline expérimental : chargement des données,
+simulation multicentrique, construction des datasets TensorFlow, optimisation
+Optuna, entraînement centralisé, entraînement FedAvg, entraînement FedBN et
+visualisation comparative des courbes d'AUC. Il ne constitue pas une validation
+clinique.
 
-Le notebook n'affirme pas que FedBN est définitivement supérieur. Il fournit un
-cadre reproductible pour étudier si la conservation locale des statistiques
-``BatchNormalization`` peut améliorer la robustesse face à un ``domain shift``
-simulé.
+Données utilisées
+-----------------
 
-Environnement expérimental
---------------------------
-
-Le notebook utilise uniquement la stack suivante :
-
-* Python ;
-* TensorFlow/Keras ;
-* NumPy ;
-* Matplotlib ;
-* Optuna ;
-* ``pathlib`` et ``os`` pour les chemins et utilitaires standards.
-
-La configuration principale est définie dans le notebook :
-
-.. code-block:: python
-
-   IMAGE_SIZE = (224, 224)
-   BATCH_SIZE = 4
-   COMMUNICATION_ROUNDS = 20
-   TEST_SIZE = 0.20
-   RANDOM_SEED = 42
-   FAST_DEV_RUN = False
-   MODEL_PATH = PROJECT_ROOT / "models" / "evotrack_siamese_best.keras"
-
-Lorsque ``FAST_DEV_RUN`` vaut ``True``, le notebook réduit le nombre d'essais
-Optuna, les rounds d'optimisation et les rounds de benchmark pour permettre un
-test rapide. Dans la version actuelle, ``FAST_DEV_RUN`` est défini à ``False``
-par défaut.
-
-Données et fallback synthétique
--------------------------------
-
-Le notebook tente d'abord de charger des paires ``T0/T1`` depuis :
+Le notebook tente d'abord de charger des paires longitudinales ``T0/T1`` depuis
+les dossiers suivants :
 
 .. code-block:: text
 
    outputs/tcia_preprocessed/images_T0
    outputs/tcia_preprocessed/images_T1
 
-Les formats acceptés incluent ``png``, ``jpg``, ``jpeg``, ``bmp``, ``tif``,
-``tiff`` et ``npy``. Les images sont chargées en niveaux de gris, redimensionnées
-à ``224 x 224`` et converties en tableaux NumPy.
+Les formats pris en charge incluent ``png``, ``jpg``, ``jpeg``, ``bmp``,
+``tif``, ``tiff`` et ``npy``. Les images sont chargées en niveaux de gris,
+redimensionnées et converties en tableaux NumPy.
 
-Si les dossiers ou les images ne sont pas disponibles, le notebook utilise
-``generate_synthetic_pairs`` pour créer un petit dataset synthétique. Ce fallback
-sert uniquement à vérifier que le pipeline s'exécute de bout en bout. Il ne
-représente pas des données cliniques.
-
-Labels temporaires
-------------------
+Si ces données ne sont pas disponibles localement, le notebook utilise un
+fallback synthétique minimal via ``generate_synthetic_pairs``. Ce fallback sert
+à rendre le notebook exécutable de bout en bout, mais il ne représente pas des
+données cliniques.
 
 Lorsque les données réelles sont chargées depuis ``outputs/tcia_preprocessed``,
-le notebook crée des labels temporaires équilibrés :
+les labels actuels sont temporaires et équilibrés :
 
 .. code-block:: python
 
    labels = np.zeros((n,), dtype=np.float32)
    labels[1::2] = 1.0
 
-Ces labels sont explicitement provisoires. Ils permettent de calculer une AUC et
-de tester le banc d'essai, mais ils ne remplacent pas des annotations cliniques
-validées. Les résultats dépendent donc fortement du petit jeu de test et de ces
-labels temporaires.
+Ces labels permettent de calculer une AUC pour le benchmark, mais ils ne doivent
+pas être présentés comme des annotations cliniques réelles.
 
-EPIC 1 — Partitionnement Non-IID des données cliniques
-------------------------------------------------------
+Simulation multicentrique
+-------------------------
 
-Le notebook applique d'abord un partitionnement train/test stratifié via
-``stratified_train_test_split``. Le test global représente ``TEST_SIZE = 0.20``,
-soit 20 % des données.
-
-Les indices d'entraînement sont ensuite répartis entre trois hôpitaux virtuels
-avec ``split_three_hospitals_stratified``. Cette fonction conserve autant que
-possible une distribution équilibrée des classes dans ``A``, ``B`` et ``C``.
-
-Les trois centres virtuels sont simulés ainsi :
+Le notebook applique un partitionnement stratifié train/test, avec
+``TEST_SIZE = 0.20``. Les données d'entraînement sont ensuite réparties de
+manière stratifiée entre trois hôpitaux virtuels.
 
 .. list-table::
    :header-rows: 1
 
    * - Hôpital
-     - Rôle expérimental
-     - Transformation appliquée
+     - Description
+     - Transformation
    * - A
-     - Référence
-     - Aucune transformation avant prétraitement.
+     - Données standards
+     - Aucune transformation spécifique.
    * - B
-     - Biais gain/offset
+     - Biais de gain et d'offset
      - ``I' = clip(1.2 * I + 15, 0, 255)``.
    * - C
-     - Bruit capteur
-     - Bruit gaussien de moyenne ``0`` et ``sigma = 5``.
+     - Données bruitées
+     - Bruit gaussien avec ``sigma = 5``.
 
-Prétraitement et datasets TensorFlow
-------------------------------------
+Ces transformations simulent un ``domain shift`` entre centres, par exemple des
+différences de calibration ou de bruit d'acquisition.
 
-La fonction ``make_dataset`` applique le ``domain shift`` correspondant à
-l'hôpital, convertit les images grayscale 1 canal en images 3 canaux avec
-``ensure_three_channels``, puis construit un ``tf.data.Dataset``.
+Prétraitement
+-------------
 
-La fonction ``preprocess_pair`` effectue :
+La fonction ``make_dataset`` construit les datasets TensorFlow associés aux
+trois hôpitaux et au test global. Le prétraitement appliqué comprend :
 
-* resize vers ``IMAGE_SIZE = (224, 224)`` ;
-* normalisation dans ``[-1, 1]`` ;
-* format de sortie ``((image_T0, image_T1), label)`` pour un modèle siamois à
-  deux entrées.
+* redimensionnement en ``224 x 224`` ;
+* conversion des images grayscale vers 3 canaux si nécessaire ;
+* normalisation dans l'intervalle ``[-1, 1]`` ;
+* format de sortie ``((image_T0, image_T1), label)`` pour un modèle siamois.
 
-Les objets créés sont :
+Les datasets produits sont :
 
 * ``ds_A`` ;
 * ``ds_B`` ;
 * ``ds_C`` ;
 * ``test_ds``.
 
-EPIC 2 — Modèle siamois et agrégation Keras
--------------------------------------------
+Modèle utilisé
+--------------
 
 Le notebook tente de charger le modèle pré-entraîné :
 
@@ -153,110 +114,90 @@ Le notebook tente de charger le modèle pré-entraîné :
 
    models/evotrack_siamese_best.keras
 
-Le chargement utilise ``safe_mode=False`` et fournit la fonction custom
-``absolute_difference`` via ``custom_objects``. Cette fonction est enregistrée
-avec ``@tf.keras.utils.register_keras_serializable`` et calcule la différence
-absolue entre les représentations ``T0`` et ``T1``.
+Le chargement fournit la fonction personnalisée ``absolute_difference`` dans
+``custom_objects``. Cette fonction calcule la différence absolue entre les
+représentations des deux entrées ``T0`` et ``T1``.
 
-Si le modèle réel est absent ou ne peut pas être chargé, le notebook crée un
-petit modèle siamois fallback avec deux couches convolutionnelles, deux couches
-``BatchNormalization``, un pooling global, une couche ``Lambda`` de différence
-absolue et une sortie sigmoïde.
+Si le modèle réel ne peut pas être chargé, un modèle siamois fallback minimal
+est utilisé. Ce fallback sert uniquement à conserver un notebook exécutable ; il
+ne remplace pas le modèle EvoTrack-AI pour une expérimentation complète.
 
-Les fonctions d'agrégation réellement implémentées sont :
+Stratégies comparées
+--------------------
 
-* ``iter_leaf_layers(model)`` : parcourt récursivement les couches portant des
-  poids, y compris lorsqu'elles sont imbriquées dans un sous-modèle Keras ;
-* ``get_trainable_weights_dict(model)`` : retourne les poids entraînables par
-  chemin de couche ;
-* ``aggregate_fedavg(global_model, list_local_models)`` : moyenne les poids des
-  modèles locaux et synchronise le modèle global et les modèles locaux ;
-* ``aggregate_fedbn(global_model, list_local_models)`` : applique la moyenne
-  aux couches non-BatchNorm et préserve les couches ``BatchNormalization``
-  locales.
+Centralisé
+~~~~~~~~~~
 
-La contrainte FedBN est centrale : les couches détectées comme
-``BatchNormalization`` ou dont le nom contient ``batch_normalization`` ne sont
-pas moyennées et ne sont pas écrasées sur les modèles locaux.
+Les données des hôpitaux ``A``, ``B`` et ``C`` sont concaténées dans un seul
+dataset global. Un modèle unique est entraîné puis évalué sur ``test_ds``.
 
-EPIC 3 — Recherche d'hyperparamètres avec Optuna
-------------------------------------------------
+FedAvg
+~~~~~~
 
-La fonction ``objective(trial)`` optimise deux hyperparamètres :
+Chaque hôpital entraîne un modèle local sur son propre dataset. Les poids des
+modèles locaux sont ensuite moyennés par ``aggregate_fedavg`` et synchronisés
+avec le modèle global.
+
+FedBN
+~~~~~
+
+FedBN suit le même principe que FedAvg, mais les couches
+``BatchNormalization`` restent locales. Elles ne sont pas moyennées et ne sont
+pas écrasées sur les modèles locaux. Cette stratégie vise à étudier l'effet de
+statistiques de normalisation propres à chaque centre.
+
+Optimisation avec Optuna
+------------------------
+
+Optuna est utilisé pour sélectionner deux hyperparamètres du régime fédéré :
 
 .. code-block:: python
 
    lr = trial.suggest_float("lr", 1e-5, 5e-4, log=True)
    local_epochs = trial.suggest_categorical("local_epochs", [1, 2, 3])
 
-Pour chaque essai, le notebook crée un modèle global et trois modèles locaux,
-entraîne les modèles locaux sur ``ds_A``, ``ds_B`` et ``ds_C``, puis agrège avec
-``aggregate_fedavg``. La métrique retournée à Optuna est l'AUC évaluée sur
-``test_ds``.
-
-Le nombre d'essais est contrôlé par :
+La fonction ``objective(trial)`` exécute une mini-boucle FedAvg et retourne
+l'AUC évaluée sur ``test_ds``. Le nombre d'essais et de rounds dépend de
+``FAST_DEV_RUN`` :
 
 .. code-block:: python
 
    OPTUNA_TRIALS = 2 if FAST_DEV_RUN else 15
    OPTUNA_ROUNDS = 1 if FAST_DEV_RUN else 5
 
-L'étude est lancée avec :
+Résultats produits par le notebook
+----------------------------------
 
-.. code-block:: python
+Le notebook produit trois historiques comparables :
 
-   study = optuna.create_study(direction="maximize",
-                               study_name="evotrack_sprint7_fedavg")
-   study.optimize(objective, n_trials=OPTUNA_TRIALS)
-   best_params = study.best_params
+* ``centralized_history`` ;
+* ``fedavg_history`` ;
+* ``fedbn_history``.
 
-EPIC 4 — Benchmarking des trois scénarios
------------------------------------------
-
-Le benchmark final utilise les meilleurs paramètres Optuna :
-
-.. code-block:: python
-
-   selected_lr = float(best_params.get("lr", 1e-4))
-   selected_local_epochs = int(best_params.get("local_epochs", 1))
-
-Trois scénarios sont ensuite évalués :
-
-* ``benchmark_centralized`` concatène ``ds_A``, ``ds_B`` et ``ds_C`` dans un
-  dataset global, entraîne un modèle unique et évalue l'AUC sur ``test_ds`` à
-  chaque round.
-* ``benchmark_federated(..., aggregate_fedavg)`` entraîne les trois modèles
-  locaux, applique FedAvg et évalue le modèle global.
-* ``benchmark_federated(..., aggregate_fedbn)`` utilise la même boucle, mais
-  applique FedBN.
-
-Pour chaque scénario, le notebook stocke :
+Chaque historique contient :
 
 * ``loss`` ;
 * ``auc``.
 
-Le nombre de pas temporels est contrôlé par :
+La visualisation finale trace les courbes d'AUC de validation pour les trois
+stratégies. L'axe X représente les rounds de communication ou les époques
+équivalentes, et l'axe Y représente l'AUC sur ``test_ds``.
 
-.. code-block:: python
+Limites méthodologiques
+-----------------------
 
-   BENCHMARK_ROUNDS = 2 if FAST_DEV_RUN else COMMUNICATION_ROUNDS
+Les résultats du benchmark dépendent fortement :
 
-EPIC 5 — Visualisation et preuve expérimentale
-----------------------------------------------
+* du nombre de paires disponibles ;
+* de la taille du jeu de test ;
+* des labels temporaires utilisés pour permettre le calcul de l'AUC ;
+* du modèle chargé depuis ``models/evotrack_siamese_best.keras`` ou du fallback ;
+* des transformations simulées pour les hôpitaux virtuels ;
+* des hyperparamètres sélectionnés par Optuna.
 
-La visualisation finale trace les courbes d'AUC pour :
-
-* ``Centralise`` ;
-* ``FedAvg`` ;
-* ``FedBN``.
-
-L'axe X représente les rounds de communication ou les époques équivalentes.
-L'axe Y représente l'AUC de validation sur ``test_ds``. La figure inclut un
-titre, une grille, une légende et des couleurs distinctes.
-
-Cette figure valide surtout la chaîne expérimentale : données, simulation
-multicentrique, optimisation, entraînement et visualisation. Elle ne prouve pas
-une performance clinique.
+Le benchmark ne prouve pas une supériorité clinique de FedBN. Il sert à valider
+un protocole expérimental reproductible et à comparer le comportement relatif
+de plusieurs stratégies d'entraînement dans un cadre contrôlé.
 
 Instructions d'exécution
 ------------------------
@@ -278,28 +219,16 @@ Pour utiliser le modèle réel, le fichier suivant doit être présent :
 
    models/evotrack_siamese_best.keras
 
-Si ce fichier est absent, si ``FAST_DEV_RUN`` vaut ``True`` ou si le chargement
-du modèle échoue, le notebook utilise le modèle fallback minimal. Pour utiliser
-les paires TCIA prétraitées, les dossiers suivants doivent être présents :
+Pour utiliser les paires prétraitées, les dossiers suivants doivent être
+présents :
 
 .. code-block:: text
 
    outputs/tcia_preprocessed/images_T0
    outputs/tcia_preprocessed/images_T1
 
-Sinon, le fallback synthétique est utilisé.
-
-Livrables attendus
-------------------
-
-Les livrables du notebook sont :
-
-* les datasets ``ds_A``, ``ds_B``, ``ds_C`` et ``test_ds`` ;
-* une étude Optuna et un dictionnaire ``best_params`` ;
-* trois historiques ``centralized_history``, ``fedavg_history`` et
-  ``fedbn_history`` ;
-* les métriques ``loss`` et ``auc`` pour chaque scénario ;
-* un graphique final comparant ``Centralise / FedAvg / FedBN``.
+Si les données ne sont pas disponibles, le fallback synthétique est utilisé. Si
+le modèle réel ne charge pas, le modèle fallback minimal est utilisé.
 
 Formules utiles
 ---------------
@@ -333,16 +262,3 @@ Agrégation FedBN :
 
 Les paramètres des couches ``BatchNormalization`` restent locaux dans le
 scénario FedBN.
-
-Note méthodologique
--------------------
-
-Le Sprint 7 doit être lu comme un benchmark d'ingénierie et de méthode. Les
-résultats dépendent du nombre de paires disponibles, du petit jeu de test, des
-labels temporaires, des transformations simulées, du modèle chargé et des
-hyperparamètres sélectionnés par Optuna.
-
-Aucun résultat numérique ne doit être documenté sans exécution réelle du
-notebook. Aucune conclusion clinique ne doit être tirée sans annotations
-validées, protocole médical dédié, validation externe et analyse statistique
-appropriée.

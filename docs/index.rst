@@ -45,7 +45,7 @@ aucune performance clinique non validée.
 
 .. toctree::
    :maxdepth: 2
-   :caption: Sprints
+   :caption: Benchmarks
 
    sprints/sprint_7
 
